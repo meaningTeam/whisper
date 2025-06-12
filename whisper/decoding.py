@@ -15,7 +15,6 @@ if TYPE_CHECKING:
     from .model import Whisper
 
 
-@torch.no_grad()
 def detect_language(
     model: "Whisper", mel: Tensor, tokenizer: Tokenizer = None
 ) -> Tuple[Tensor, List[dict]]:
@@ -74,7 +73,7 @@ def detect_language(
         language_tokens = language_tokens[0]
         language_probs = language_probs[0]
 
-    return language_tokens, language_probs
+    return language_tokens, language_probs, logits
 
 
 @dataclass(frozen=True)
@@ -125,6 +124,8 @@ class DecodingResult:
     no_speech_prob: float = np.nan
     temperature: float = np.nan
     compression_ratio: float = np.nan
+    language_logits: Optional[Tensor] = None
+    token_logits: Optional[Tensor] = None
 
 
 class Inference:
@@ -666,20 +667,22 @@ class DecodingTask:
     def _detect_language(self, audio_features: Tensor, tokens: Tensor):
         languages = [self.options.language] * audio_features.shape[0]
         lang_probs = None
+        lang_logits = [None] * audio_features.shape[0]
 
         if self.options.language is None or self.options.task == "lang_id":
-            lang_tokens, lang_probs = self.model.detect_language(
+            lang_tokens, lang_probs, lang_logits = self.model.detect_language(
                 audio_features, self.tokenizer
             )
             languages = [max(probs, key=probs.get) for probs in lang_probs]
             if self.options.language is None:
                 tokens[:, self.sot_index + 1] = lang_tokens  # write language tokens
 
-        return languages, lang_probs
+        return languages, lang_probs, lang_logits
 
     def _main_loop(self, audio_features: Tensor, tokens: Tensor):
         n_batch = tokens.shape[0]
         sum_logprobs: Tensor = torch.zeros(n_batch, device=audio_features.device)
+        all_logits: Optional[Tensor] = None
         no_speech_probs = [np.nan] * n_batch
 
         try:
@@ -691,6 +694,11 @@ class DecodingTask:
                 ):  # save no_speech_probs
                     probs_at_sot = logits[:, self.sot_index].float().softmax(dim=-1)
                     no_speech_probs = probs_at_sot[:, self.tokenizer.no_speech].tolist()
+
+                if all_logits is None:
+                    all_logits = logits
+                else:
+                    all_logits = torch.cat([all_logits, logits], dim=1)
 
                 # now we need to consider the logits at the last token only
                 logits = logits[:, -1]
@@ -707,9 +715,8 @@ class DecodingTask:
         finally:
             self.inference.cleanup_caching()
 
-        return tokens, sum_logprobs, no_speech_probs
+        return tokens, sum_logprobs, no_speech_probs, all_logits
 
-    @torch.no_grad()
     def run(self, mel: Tensor) -> List[DecodingResult]:
         self.decoder.reset()
         tokenizer: Tokenizer = self.tokenizer
@@ -719,14 +726,14 @@ class DecodingTask:
         tokens: Tensor = torch.tensor([self.initial_tokens]).repeat(n_audio, 1)
 
         # detect language if requested, overwriting the language token
-        languages, language_probs = self._detect_language(audio_features, tokens)
+        languages, language_probs, language_logits = self._detect_language(audio_features, tokens)
         if self.options.task == "lang_id":
             return [
                 DecodingResult(
-                    audio_features=features, language=language, language_probs=probs
+                    audio_features=features, language=language, language_probs=probs, language_logits=logits
                 )
-                for features, language, probs in zip(
-                    audio_features, languages, language_probs
+                for features, language, probs, logits in zip(
+                    audio_features, languages, language_probs, language_logits
                 )
             ]
 
@@ -734,7 +741,7 @@ class DecodingTask:
         tokens = tokens.repeat_interleave(self.n_group, dim=0).to(audio_features.device)
 
         # call the main sampling loop
-        tokens, sum_logprobs, no_speech_probs = self._main_loop(audio_features, tokens)
+        tokens, sum_logprobs, no_speech_probs, token_logits = self._main_loop(audio_features, tokens)
 
         # reshape the tensors to have (n_audio, n_group) as the first two dimensions
         audio_features = audio_features[:: self.n_group]
@@ -768,6 +775,8 @@ class DecodingTask:
             audio_features,
             avg_logprobs,
             no_speech_probs,
+            token_logits,
+            language_logits,
         )
         if len(set(map(len, fields))) != 1:
             raise RuntimeError(f"inconsistent result lengths: {list(map(len, fields))}")
@@ -782,14 +791,15 @@ class DecodingTask:
                 no_speech_prob=no_speech_prob,
                 temperature=self.options.temperature,
                 compression_ratio=compression_ratio(text),
+                token_logits=token_logit,
+                language_logits=language_logit,
             )
-            for text, language, tokens, features, avg_logprob, no_speech_prob in zip(
+            for text, language, tokens, features, avg_logprob, no_speech_prob, token_logit, language_logit in zip(
                 *fields
             )
         ]
 
 
-@torch.no_grad()
 def decode(
     model: "Whisper",
     mel: Tensor,
