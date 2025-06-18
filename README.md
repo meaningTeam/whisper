@@ -30,7 +30,7 @@ Transcription can also be performed within Python:
 ```python
 import whisper
 
-model = whisper.load_model("tutinyrbo")
+model = whisper.load_model("tiny")
 result = model.transcribe("audio.mp3")
 ```
 
@@ -67,6 +67,22 @@ print(result.tokens)
 print(result.token_logits)
 print(result.language_logits)
 ```
+
+Teacher-forced inference can be done as follows.
+```python
+from whisper.tokenizer import get_tokenizer
+
+tokenizer = get_tokenizer(
+    model.is_multilingual, num_languages=model.num_languages
+)
+tf_tokens = torch.tensor(tokenizer.encode("tomas is the best, said marian."))
+# tf_tokens.shape --> (10,)
+
+options = whisper.DecodingOptions(sample_len=1)
+result = whisper.decode(model, mel, tf_tokens=tf_tokens, options=options)
+# result.token_logits.shape --> (14,) because 3 leading special tokens and 1 end of transcript token
+``` 
+
 
 ## License
 

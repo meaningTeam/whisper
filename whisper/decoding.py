@@ -157,9 +157,9 @@ class PyTorchInference(Inference):
         if not self.kv_cache:
             self.kv_cache, self.hooks = self.model.install_kv_cache_hooks()
 
-        if tokens.shape[-1] > self.initial_token_length:
-            # only need to use the last token except in the first forward pass
-            tokens = tokens[:, -1:]
+        # if tokens.shape[-1] > self.initial_token_length:
+        #     # only need to use the last token except in the first forward pass
+        #     tokens = tokens[:, -1:]
 
         return self.model.decoder(tokens, audio_features, kv_cache=self.kv_cache)
 
@@ -687,7 +687,13 @@ class DecodingTask:
 
         try:
             for i in range(self.sample_len):
-                logits = self.inference.logits(tokens, audio_features)
+
+                input_tokens = tokens
+                if i > 0:
+                    # only need to use the last token except in the first forward pass
+                    input_tokens = tokens[:, -1:]
+                    
+                logits = self.inference.logits(input_tokens, audio_features)
 
                 if (
                     i == 0 and self.tokenizer.no_speech is not None
@@ -717,13 +723,19 @@ class DecodingTask:
 
         return tokens, sum_logprobs, no_speech_probs, all_logits
 
-    def run(self, mel: Tensor) -> List[DecodingResult]:
+    def run(self, mel: Tensor, tf_tokens: Tensor | None = None) -> List[DecodingResult]:
         self.decoder.reset()
         tokenizer: Tokenizer = self.tokenizer
         n_audio: int = mel.shape[0]
 
         audio_features: Tensor = self._get_audio_features(mel)  # encoder forward pass
         tokens: Tensor = torch.tensor([self.initial_tokens]).repeat(n_audio, 1)
+
+        if tf_tokens is not None:
+            assert self.sample_len == 1, "tf_tokens can only be used with sample_len=1"
+            assert self.n_group == 1, "tf_tokens can only be used with beam_size=1"
+            eot_tokens: Tensor = torch.tensor([[tokenizer.eot]]).repeat(n_audio, 1).to(audio_features.device)
+            tokens = torch.cat([tokens, tf_tokens, eot_tokens], dim=1)
 
         # detect language if requested, overwriting the language token
         languages, language_probs, language_logits = self._detect_language(audio_features, tokens)
@@ -803,6 +815,7 @@ class DecodingTask:
 def decode(
     model: "Whisper",
     mel: Tensor,
+    tf_tokens: Tensor | None = None,
     options: DecodingOptions = DecodingOptions(),
     **kwargs,
 ) -> Union[DecodingResult, List[DecodingResult]]:
@@ -827,10 +840,12 @@ def decode(
     """
     if single := mel.ndim == 2:
         mel = mel.unsqueeze(0)
+        if tf_tokens is not None:
+            tf_tokens = tf_tokens.unsqueeze(0)
 
     if kwargs:
         options = replace(options, **kwargs)
 
-    result = DecodingTask(model, options).run(mel)
+    result = DecodingTask(model, options).run(mel, tf_tokens)
 
     return result[0] if single else result
