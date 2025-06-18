@@ -815,8 +815,8 @@ class DecodingTask:
 def decode(
     model: "Whisper",
     mel: Tensor,
-    tf_tokens: Tensor | None = None,
     options: DecodingOptions = DecodingOptions(),
+    tf_tokens: Tensor | None = None,
     **kwargs,
 ) -> Union[DecodingResult, List[DecodingResult]]:
     """
